@@ -1,0 +1,560 @@
+import numpy as np
+import pandas as pd
+import sklearn
+from keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import f1_score
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import LabelEncoder
+from sklearn.mixture import GaussianMixture
+from scipy.stats import multivariate_normal
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import Dropout
+from sklearn.cluster import SpectralClustering
+import keras
+from keras.optimizers import Adam
+import keras.backend as K
+from keras.layers import Input
+from tensorflow.python.keras.models import Model
+from scipy.stats import multivariate_normal
+import tensorflow as tf
+from keras.models import load_model
+from keras.models import save_model
+from sklearn.utils import class_weight
+import warnings
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+warnings.filterwarnings("ignore")
+
+n = 10000 #number of labeled points
+m = 20 #number of experiments
+n_components = 2
+
+def transformText(data, column_name):
+    cities = np.unique(data[column_name].to_numpy())
+    d = {}
+    count = 0
+    for el in cities:
+        if el not in d:
+            count += 1
+
+        d[el] = count
+
+    categories = []
+
+    for i in range(data.shape[0]):
+        categories.append(d[data[column_name].iloc[i]])
+
+    data[column_name] = np.array(categories)
+
+    return data
+
+
+def dataPreporationToy(data):
+    data = data.drop("Number",1)
+
+    Y = data["Illness"].to_numpy()
+
+    mask_y = Y == "Yes"
+
+    Y[mask_y] = 1
+
+    Y[~mask_y] = 0
+
+    data = data.drop("Illness",1)
+
+    data = transformText(data)
+
+    gender = data["Gender"]
+
+    mask_gender = gender == "Male"
+
+    gender_num = np.zeros((data.shape[0],1))
+
+    gender_num[mask_gender] = 1
+
+    data["Gender"] = gender_num
+
+    X = data.to_numpy()
+
+    X_train,X_test, Y_train, Y_test = train_test_split(X,Y,test_size=0.1)
+
+    Y_train = np.expand_dims(Y_train,1)
+
+    Y_test = np.expand_dims(Y_test,1)
+
+    return X_train, Y_train,X_test, Y_test
+
+
+def preprocessAdultData(data):
+    Y = data["binary"].to_numpy()
+
+    data = data.drop("binary",1)
+    data = data.drop("Unnamed: 0",1)
+    X = data.to_numpy()
+    return X,Y
+
+
+class ActiveLearning:
+    def __init__(self,X,Y,n,m,n_components,sigma_2,epochs,noise_dim,batch_size,N,computation_size,label=False):
+        self.X = X
+        self.Y = Y
+        self.n = n
+        self.m = m
+        self.baseline_f1_logistic = 0
+        self.clustering_f1_logistic = 0
+        self.gmm_f1_logistic = 0
+        self.baseline_f1_nn = 0
+        self.clustering_f1_nn = 0
+        self.gmm_f1_nn = 0
+        self.X_train = X
+        self.Y_train = Y
+        self.X_test = X
+        self.Y_test = Y
+        self.label = label
+        self.n_components = n_components
+        self.sigma_2 = sigma_2
+        self.epochs = epochs
+        self.noise_dim = noise_dim
+        self.batch_size = batch_size
+        self.N = N
+        self.gan_logistic = 0
+        self.gan_nn = 0
+        self.computation_size = computation_size
+        self.gan_logistic_list = []
+        self.gan_nn_list = []
+        self.uncertainty_samplig_lg = 0
+        self.uncertainty_samplig_nn = 0
+        self.uncertainty_samplig_iter_lg = 0
+        self.uncertainty_samplig_iter_nn = 0
+
+
+    def splitData(self):
+        X_train, X_test, Y_train, Y_test = train_test_split(self.X, self.Y, test_size=0.1,random_state=0)
+        Y_train = np.expand_dims(Y_train, 1)
+        Y_test = np.expand_dims(Y_test, 1)
+        self.X_train = X_train
+        self.Y_train = Y_train
+        self.X_test = X_test
+        self.Y_test = Y_test
+
+
+    def neuralNetwork(self, X_train_labeled, Y_train_labeled, uncertainty=False):
+        model = Sequential()
+        model.add(Dense(50, input_dim=self.X_train.shape[1], activation='relu'))
+        model.add(Dropout(0.2))
+        model.add(Dense(50, activation='relu'))
+        model.add(Dropout(0.2))
+        model.add(Dense(1, activation='sigmoid'))
+        model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+        weights = class_weight.compute_class_weight('balanced',
+                                                    np.unique(Y_train_labeled),
+
+                                                    Y_train_labeled.reshape(Y_train_labeled.shape[0],))
+
+        weights = {i: weights[i] for i in range(weights.shape[0])}
+        model.fit(X_train_labeled, Y_train_labeled, epochs=20, batch_size=10,class_weight=weights)
+
+        if uncertainty:
+            return model
+        preds = (model.predict(self.X_test) > 0.5).astype(int)
+        return f1_score(preds, self.Y_test.astype(int))
+
+
+    def computeMasks(self):
+        mask1 = np.zeros(self.X_train.shape[0], bool)
+        mask2 = np.ones(self.X_train.shape[0], bool) # X_left elements
+        if self.label:
+            n = int(self.n / 2)
+            indices = np.expand_dims(np.random.choice(self.X_train.shape[0], n, replace=False), 1)
+            mask1[indices] = True
+            mask2[indices] = False
+            X_left = self.X_train[mask2]
+
+        else:
+            n = self.n
+            X_left = self.X_train
+            mask1 = np.zeros(self.X_train.shape[0], bool)
+
+        return mask1, mask2, X_left,n
+
+
+    def plotProjectedData(self):
+        pca = PCA(n_components=2)
+        X_projected = pca.fit_transform(self.X_train)
+        colors = ListedColormap(['r', 'b'])
+        scatter = plt.scatter(X_projected[:,0], X_projected[:,1], s=10, c=self.Y_train[:,0], cmap=colors)
+        plt.legend(handles=scatter.legend_elements()[0],labels=["Class 1","Class 2"])
+        plt.title("data")
+        plt.savefig("plots/data.png")
+        plt.show()
+
+
+    def plotInformativePoints(self,mask,name):
+        pca = PCA(n_components=2)
+        X_projected = pca.fit_transform(self.X_train)
+        Y_informative = np.zeros((self.X_train.shape[0],1))
+        Y_informative[mask] = 1
+        colors = ListedColormap(['r', 'b'])
+        scatter = plt.scatter(X_projected[:, 0], X_projected[:, 1], s=10, c=Y_informative[:, 0], cmap=colors)
+        plt.legend(handles=scatter.legend_elements()[0], labels=["non informative", "informative"])
+        plt.title("informative using " + name)
+        plt.savefig("plots/info_" + name + ".png")
+        plt.show()
+
+
+    def baselineMethod(self):
+        indices = np.expand_dims(np.random.choice(self.X_train.shape[0], n, replace=False), 1)
+        X_train_labeled = self.X_train[indices]
+        X_train_labeled = np.reshape(X_train_labeled, (X_train_labeled.shape[0], X_train_labeled.shape[2]))
+        Y_train_labeled = self.Y_train[indices]
+
+        Y_train_labeled = np.reshape(Y_train_labeled, (Y_train_labeled.shape[0], Y_train_labeled.shape[2])).astype(int)
+        clf = LogisticRegression(class_weight="balanced").fit(X_train_labeled, Y_train_labeled[:,0])
+        f1 = f1_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int))
+        #print("baseline", accuracy_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int)))
+        #self.baseline_f1_nn += self.neuralNetwork(X_train_labeled, Y_train_labeled)
+        self.baseline_f1_logistic += f1
+
+
+    def uncertaintySampling(self):
+        mask1, mask2, X_left, n = self.computeMasks()
+        X_train = self.X_train[~mask2]
+        Y_train = self.Y_train[~mask2]
+        clf = LogisticRegression(class_weight="balanced").fit(X_train, Y_train[:, 0])
+        probs = clf.predict_proba(X_left)
+        distances = np.abs(probs[:,1] - 0.5)
+        sorted_distances = np.sort(distances)
+        n_element = sorted_distances[n - 1]
+        distances = np.abs(clf.predict_proba(self.X_train)[:,1] - 0.5)
+        mask2 = (distances <= n_element) & mask2
+        X_train_labeled = self.X_train[mask2 | mask1]
+        Y_train_labeled = self.Y_train[mask2 | mask1].astype(int)
+        clf = LogisticRegression(class_weight="balanced").fit(X_train_labeled, Y_train_labeled[:, 0])
+        f1 = f1_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int))
+        self.uncertainty_samplig_lg += f1
+        #######
+
+        mask1, mask2, X_left, n = self.computeMasks()
+        X_train = self.X_train[~mask2]
+        Y_train = self.Y_train[~mask2]
+        model = self.neuralNetwork(X_train, Y_train, uncertainty=True)
+        probs = model.predict(X_left)
+        distances = np.abs(probs[:, 0] - 0.5)
+        sorted_distances = np.sort(distances)
+        n_element = sorted_distances[n - 1]
+        distances = np.abs(clf.predict_proba(self.X_train)[:, 1] - 0.5)
+        mask2 = (distances <= n_element) & mask2
+        X_train_labeled = self.X_train[mask2 | mask1]
+        Y_train_labeled = self.Y_train[mask2 | mask1].astype(int)
+        self.plotInformativePoints(mask2, "uncertainty")
+        self.uncertainty_samplig_nn += self.neuralNetwork(X_train_labeled, Y_train_labeled)
+
+
+    def uncertaintySamplingIterative(self):
+        mask1, mask2, X_left, n = self.computeMasks()
+        Y_left = self.Y_train[mask2]
+        X_train_curr = self.X_train[~mask2]
+        Y_train_curr = self.Y_train[~mask2]
+        for i in range(n):
+            print(i)
+            clf = LogisticRegression(class_weight="balanced").fit(X_train_curr, Y_train_curr[:, 0])
+            probs = clf.predict_proba(X_left)
+            distances = np.abs(probs[:, 0] - 0.5)
+            argmin = np.argmin(distances)
+            X_curr = np.reshape(X_left[argmin],(1,X_train_curr.shape[1]))
+            Y_curr = np.reshape(Y_left[argmin],(1,1))
+            Y_train_curr = np.concatenate((Y_train_curr,Y_curr))
+            X_train_curr = np.concatenate((X_train_curr, X_curr))
+            X_left = np.delete(X_left,argmin,axis=0)
+            Y_left = np.delete(Y_left,argmin,axis=0)
+
+        print(X_train_curr.shape)
+        clf = LogisticRegression(class_weight="balanced").fit(X_train_curr, Y_train_curr[:, 0])
+        f1 = f1_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int))
+        self.uncertainty_samplig_iter_lg += f1
+        self.uncertainty_samplig_iter_nn += self.neuralNetwork(X_train_curr, Y_train_curr)
+
+    def clusteringKmeans(self):
+        mask1,mask2,X_left,n = self.computeMasks()
+
+        kmeans = KMeans(n_clusters=self.n_components).fit(X_left)
+        labels = kmeans.predict(X_left)
+        distances = np.linalg.norm(X_left - kmeans.cluster_centers_[labels], axis=1)
+        sorted_distances = np.sort(distances)
+        n_element = sorted_distances[n - 1]
+
+        labels = kmeans.predict(self.X_train)
+        distances = np.linalg.norm(self.X_train - kmeans.cluster_centers_[labels], axis=1)
+        mask2 = (distances <= n_element) & mask2
+        X_train_labeled = self.X_train[mask2 | mask1]
+        Y_train_labeled = self.Y_train[mask2 | mask1].astype(int)
+        self.plotInformativePoints(mask2,"clustering")
+        clf = LogisticRegression(class_weight="balanced").fit(X_train_labeled, Y_train_labeled[:,0])
+        f1 = f1_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int))
+        #print("cluster", accuracy_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int)))
+        #self.clustering_f1_nn += self.neuralNetwork(X_train_labeled, Y_train_labeled)
+        self.clustering_f1_logistic += f1
+
+
+    def computelikelihoodIndependent(self,means, cov, index):
+        mnormal = multivariate_normal(mean=means[index], cov=cov[index])
+        pdfs = mnormal.pdf(self.X_train)
+        sorted_pdfs = np.sort(pdfs)
+        n_element = sorted_pdfs[::-1][int((n-1)/2)]
+        mask = pdfs >= n_element
+        return mask
+
+
+    def gaussianMixtures(self):
+        mask1, mask2, X_left, n = self.computeMasks()
+
+        gm = GaussianMixture(n_components=self.n_components).fit(X_left)
+        likelihoods = gm.score_samples(X_left)
+        sorted_likelihoods = np.sort(likelihoods)
+        n_element = sorted_likelihoods[::-1][n-1]
+
+        likelihoods = gm.score_samples(self.X_train)
+        mask2 = (likelihoods >= n_element) & mask2
+        X_train_labeled = self.X_train[mask2 | mask1]
+        Y_train_labeled = self.Y_train[mask2 | mask1]
+        clf = LogisticRegression(class_weight="balanced").fit(X_train_labeled, Y_train_labeled[:,0])
+        f1 = f1_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int))
+        #print("gm",accuracy_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int)))
+        self.plotInformativePoints(mask2, "gmm")
+        #self.gmm_f1_nn += self.neuralNetwork(X_train_labeled, Y_train_labeled)
+        self.gmm_f1_logistic += f1
+
+        mask1 = self.computelikelihoodIndependent(gm.means_, gm.covariances_,0)
+        mask2 = self.computelikelihoodIndependent(gm.means_, gm.covariances_, 1)
+        mask = mask1 | mask2
+        X_train_labeled = self.X_train[mask]
+        Y_train_labeled = self.Y_train[mask]
+
+        clf = LogisticRegression(class_weight="balanced").fit(X_train_labeled, Y_train_labeled[:,0])
+
+
+    def generatorG(self):
+        inputs = Input(shape=(k,))
+        layer1 = Dense(512, activation='relu')(inputs)
+        layer2 = Dense(512, activation='relu')(layer1)
+        layer3 = Dense(512, activation='relu')(layer2)
+        layer4 = Dense(512, activation='relu')(layer3)
+        layer5 = Dense(512, activation='relu')(layer4)
+        drop_layer = Dropout(0.5)(layer5)
+        layer6 = Dense(512, activation='relu')(drop_layer)
+        layer7 = Dense(512, activation='relu')(layer6)
+        layer8 = Dense(512, activation='relu')(layer7)
+        drop_layer_2 = Dropout(0.5)(layer8)
+        layer9 = Dense(512, activation='relu')(drop_layer_2)
+        layer10 = Dense(512, activation='relu')(layer9)
+        predictions = Dense(self.X.shape[1], name="output_layer")(layer10)
+
+        model = Model(inputs=inputs, outputs=predictions)
+
+        return model
+
+
+    def generatorH(self):
+        inputs = Input(shape=(k,))
+        layer1 = Dense(256, activation='relu')(inputs)
+        layer2 = Dense(256, activation='relu')(layer1)
+        layer3 = Dense(256, activation='relu')(layer2)
+        layer4 = Dense(256, activation='relu')(layer3)
+        layer5 = Dense(256, activation='relu')(layer4)
+        drop_layer = Dropout(0.5)(layer5)
+        layer6 = Dense(256, activation='relu')(drop_layer)
+        layer7 = Dense(256, activation='relu')(layer6)
+        layer8 = Dense(256, activation='relu')(layer7)
+        drop_layer_2 = Dropout(0.5)(layer8)
+        layer9 = Dense(256, activation='relu')(drop_layer_2)
+        layer10 = Dense(256, activation='relu')(layer9)
+        predictions = Dense(self.X.shape[1], name="output_layer")(layer10)
+
+        model = Model(inputs=inputs, outputs=predictions)
+
+        return model
+
+
+    def discriminatorX(self):
+        inputs = Input(shape=(self.X.shape[1],))
+        layer1 = Dense(256, activation='relu')(inputs)
+        layer2 = Dense(256, activation='relu')(layer1)
+        layer3 = Dense(256, activation='relu')(layer2)
+        layer4 = Dense(256, activation='relu')(layer3)
+        predictions = Dense(1, activation="sigmoid", name="output_layer")(layer4)
+
+        model = Model(inputs=inputs, outputs=predictions)
+
+        return model
+
+    def discriminatorZ(self):
+        inputs = Input(shape=(self.X.shape[1],))
+        layer1 = Dense(128, activation='relu')(inputs)
+        layer2 = Dense(128, activation='relu')(layer1)
+        predictions = Dense(1, activation="sigmoid", name="output_layer")(layer2)
+
+        model = Model(inputs=inputs, outputs=predictions)
+
+        return model
+
+
+    def lossG(self,discriminator):
+        def loss(y_true, y_pred):
+            return K.mean((discriminator(y_pred) - y_true) ** 2)
+
+        return loss
+
+
+    def lossH(self, discriminator):
+        def loss(y_true, y_pred):
+            return K.mean((discriminator(y_pred) - y_true) ** 2)
+
+        return loss
+
+
+    def lossDx(self,y_true, y_pred):
+        return K.mean((y_pred - y_true) ** 2)
+
+
+    def lossDz(self,y_true, y_pred):
+        return K.mean((y_pred - y_true) ** 2)
+
+
+    def normalPdf(self,X, generated):
+        return np.exp(-(1 / (2 * self.sigma_2)) * np.linalg.norm(X - generated,axis=2)**2)
+
+
+    def densityEstimation(self,X,generator_,size=40):
+        z = np.random.multivariate_normal(np.zeros((self.noise_dim,)),
+                                          cov=np.eye(self.noise_dim),size=(self.N,size))
+        generated = generator_(z)
+        return np.mean(self.normalPdf(X,generated),axis=0)
+
+
+    def ganNN(self):
+        generator_curr_G = self.generatorG()
+        discriminator_curr_X = self.discriminatorX()
+
+        generator_curr_H = self.generatorH()
+        discriminator_curr_Z = self.discriminatorZ()
+
+        generator_curr_G.save("models/generator_G.h5")
+        discriminator_curr_X.save("models/discriminator_X.h5")
+
+        generator_curr_H.save("models/generator_H.h5")
+        discriminator_curr_Z.save("models/discriminator_Z.h5")
+        mask1, mask2, X_left, n = self.computeMasks()
+
+        for i in range(self.epochs):
+            print(i, " epoch -----------------------------------")
+            norms = multivariate_normal.rvs(size=self.batch_size,mean=np.zeros((self.noise_dim,)),cov=np.eye(self.noise_dim))
+            y = np.ones((self.batch_size, 1))
+            generator_curr_G = load_model("models/generator_G.h5",compile=False)
+            discriminator_curr_X = load_model("models/discriminator_X.h5",compile=False)
+
+            generator_curr_G.trainable = True
+            discriminator_curr_X.trainable = False
+            generator_curr_G.compile(loss=self.lossG(discriminator=discriminator_curr_X), optimizer=Adam(lr=0.001), run_eagerly=True)
+            generator_curr_G.fit(norms, y, epochs=1, batch_size=1000,shuffle=True)
+
+            norms = multivariate_normal.rvs(size=self.batch_size, mean=np.zeros((self.noise_dim,)), cov=np.eye(self.noise_dim))
+            y = np.vstack((y,np.zeros((self.batch_size,1))))
+            G_z = generator_curr_G(norms)
+            indices = np.random.choice(X_left.shape[0],self.batch_size,replace=True)
+            X_train = np.vstack((X_left[indices],G_z))
+
+            generator_curr_G.trainable = False
+            discriminator_curr_X.trainable = True
+            discriminator_curr_X.compile(loss=self.lossDx, optimizer=Adam(lr=0.001), run_eagerly=True)
+            discriminator_curr_X.fit(X_train,y,epochs=1,batch_size=self.batch_size,shuffle=True)
+            generator_curr_G.save("models/generator_G.h5")
+            discriminator_curr_X.save("models/discriminator_X.h5")
+
+        pdfs = np.zeros((self.X_train.shape[0],))
+        print(discriminator_curr_X(self.X_test))
+        for i in range(0,self.X_train.shape[0],self.computation_size):
+            print(i)
+            print("logistic", np.mean(np.array(self.gan_logistic_list)))
+            print("nn",np.mean(np.array(self.gan_nn_list)))
+            if i + self.computation_size < self.X_train.shape[0]:
+                pdfs[i:i + self.computation_size] =self.densityEstimation(self.X_train[i:i+self.computation_size], generator_curr_G,
+                                               size=self.computation_size)
+            else:
+                pdfs[i:self.X_train.shape[0]] = self.densityEstimation(self.X_train[i:self.X_train.shape[0]], generator_curr_G,
+                                                   size=self.X_train.shape[0] - i)
+
+        sorted_pdfs = np.sort(pdfs[mask2])
+        n_element = sorted_pdfs[::-1][n - 1]
+        mask2 = (pdfs >= n_element) & mask2
+        X_train_labeled = self.X_train[mask2 | mask1]
+        Y_train_labeled = self.Y_train[mask2 | mask1]
+
+        self.plotInformativePoints(mask2, "GAN")
+        clf = LogisticRegression(class_weight="balanced").fit(X_train_labeled, Y_train_labeled[:, 0])
+        f1 = f1_score(clf.predict(self.X_test).astype(int), self.Y_test.astype(int))
+        self.gan_logistic += f1
+        self.gan_logistic_list.append(f1)
+        f1_nn = self.neuralNetwork(X_train_labeled, Y_train_labeled)
+        self.gan_nn += f1_nn
+        self.gan_nn_list.append(f1_nn)
+        f = open("res",mode='w')
+        f.write(str(np.mean(np.array(self.gan_logistic_list))))
+        f.write(" ")
+        f.write(str(np.mean(np.array(self.gan_nn_list))))
+        f.write(" ")
+        f.write(str(len(self.gan_nn_list)))
+        f.close()
+
+
+epochs = 20
+k = 8
+batch_size = 1000
+sigma_2 = 0.1
+
+
+def main():
+    data = pd.read_csv("adult_data.csv")
+    X, Y = preprocessAdultData(data)
+
+    active_learning = ActiveLearning(X, Y, n, m,n_components=n_components,sigma_2=sigma_2,epochs=epochs,noise_dim = k,batch_size=batch_size,N=10000,computation_size=1,label=True)
+
+    f = open("res",mode='w')
+    f.write(str(0))
+    f.write(str(0))
+    f.close()
+    for i in range(m):
+        active_learning.splitData()
+        mean = np.mean(active_learning.X_train,axis=0)
+        std = np.std(active_learning.X_train,axis=0)
+        active_learning.X_train = (active_learning.X_train - mean) / std
+        active_learning.X_test = (active_learning.X_test - mean) / std
+        active_learning.uncertaintySamplingIterative()
+        active_learning.uncertaintySampling()
+        active_learning.baselineMethod()
+        active_learning.clusteringKmeans()
+        active_learning.gaussianMixtures()
+        active_learning.ganNN()
+        print(i)
+        print("------")
+
+    print("baseline_f1_logistic: ", active_learning.baseline_f1_logistic / m)
+    print("clustering_f1_logistic", active_learning.clustering_f1_logistic / m)
+    print("gmm_f1_logistic", active_learning.gmm_f1_logistic / m)
+    print("gan_logistic", active_learning.gan_logistic / m)
+    print("uncertainty_logistic", active_learning.uncertainty_samplig_lg / m)
+    print("uncertainty_logistic_iter", active_learning.uncertainty_samplig_iter_lg / m)
+
+    print("baseline_f1_nn: ", active_learning.baseline_f1_nn / m)
+    print("clustering_f1_nn", active_learning.clustering_f1_nn / m)
+    print("gmm_f1_nn", active_learning.gmm_f1_nn / m)
+    print("uncertainty_nn", active_learning.uncertainty_samplig_nn / m)
+    print("uncertainty_nn_iter", active_learning.uncertainty_samplig_iter_nn / m)
+
+if __name__ == '__main__':
+    main()
